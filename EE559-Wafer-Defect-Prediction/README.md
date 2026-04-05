@@ -1,1 +1,0 @@
-# EE559-Wafer-Defect-Prediction
