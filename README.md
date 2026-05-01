@@ -75,7 +75,7 @@ The main preprocessing notebooks are:
 ```text
 notebooks/Preprocess_Check.ipynb
 notebooks/Preprocess_PCA.ipynb
-notebooks/Preprocess_VAE.ipynb
+notebooks/Preprocess_VAE_pass.ipynb
 ```
 
 ## Models
