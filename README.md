@@ -61,6 +61,14 @@ EE559-Wafer-Defect-Prediction/
 └── .gitignore
 ```
 
+## Repository Organization Note
+
+The `notebooks/` folder contains the experimental development process. These notebooks include exploratory trials using standard libraries such as scikit-learn, PyTorch, and XGBoost to compare methods, test preprocessing choices, and analyze model behavior.
+
+The `src/` folder contains the finalized implementation used for the formal version of the project. In particular, the final manual Linear SVM implementation and utility settings are placed under `src/`.
+
+This separation is used to distinguish exploratory experiments from the final project implementation.
+
 ## Dataset
 
 This project uses the UCI SECOM wafer manufacturing dataset. Each sample contains semiconductor manufacturing sensor measurements, and the label indicates whether the wafer passed or failed.
@@ -74,9 +82,9 @@ The label definition is:
 
 The dataset is highly imbalanced. Most samples are Pass samples, while Fail samples only represent a small portion of the dataset. Because of this, accuracy alone is not enough to evaluate the model. In this project, recall for the Fail class is especially important.
 
-## Preprocessing
+## Preprocessing and Feature Engineering
 
-The preprocessing pipeline includes the following steps:
+The basic preprocessing pipeline includes the following steps:
 
 1. Drop the `Time` column.
 2. Remove features with more than 50% missing values.
@@ -85,7 +93,13 @@ The preprocessing pipeline includes the following steps:
 5. Remove highly correlated features.
 6. Split the dataset into training, validation, and test sets.
 7. Standardize features using training-set statistics.
-8. Apply additional feature engineering methods such as PCA or VAE-based features.
+
+After the basic preprocessing steps, two additional feature engineering methods were tested:
+
+- PCA-based preprocessing
+- VAE-based preprocessing
+
+PCA was used to reduce the feature dimension and create a lower-dimensional representation of the data. The VAE-based method was used to generate reconstruction-error-related features for anomaly detection and classification experiments.
 
 The main preprocessing notebooks are:
 
@@ -95,34 +109,16 @@ notebooks/Preprocess_PCA.ipynb
 notebooks/Preprocess_VAE.ipynb
 ```
 
-## Feature Engineering
-
-Several feature representations were tested in this project.
-
-### Original Preprocessed Features
-
-The original preprocessed features were obtained after missing-value handling, constant-feature removal, correlation-based feature removal, and standardization.
-
-### PCA Features
-
-Principal Component Analysis (PCA) was used to reduce the feature dimension. PCA was fitted only on the training set, and the same transformation was applied to the validation and test sets.
-
-### VAE-Based Features
-
-A VAE-based feature engineering approach was also tested. The VAE was trained using Pass samples to learn the normal data pattern. The reconstruction error was then used as an additional anomaly-related feature.
-
 ## Models
 
-The following models or experimental settings were tested:
+After preprocessing, several training and detection methods were tested:
 
-- Linear SVM
-- Manual Linear SVM
-- PCA + Linear SVM
-- Outlier detection methods
-- VAE-enhanced features
+- SVM
 - XGBoost
+- Random Forest
+- Outlier detection methods
 
-For the manual Linear SVM experiment, the SVM training logic, prediction function, confusion matrix, and evaluation metrics were implemented directly instead of using scikit-learn model functions.
+The outlier detection experiments include methods such as Isolation Forest and One-Class SVM. These methods were tested because the Fail class is rare in the dataset, so Fail samples may behave like abnormal samples compared with Pass samples.
 
 ## Evaluation Metrics
 
