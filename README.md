@@ -130,6 +130,7 @@ Recommended order:
 ```text
 1. notebooks/Preprocess_Check.ipynb
 2. notebooks/Preprocess_PCA.ipynb
-3. notebooks/SVM.ipynb
-4. notebooks/xg_boost.ipynb
+3. notebooks/Preprocess_VAE_pass.ipynb
+4. notebooks/SVM.ipynb
+5. notebooks/xg_boost.ipynb
 ```
