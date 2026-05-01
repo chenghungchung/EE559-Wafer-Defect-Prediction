@@ -122,7 +122,7 @@ A typical workflow is:
 
 1. Run the preprocessing notebooks in the `notebooks/` folder.
 2. Save the processed `.pkl` files into the `data/` folder.
-3. Run the model notebooks, such as `SVM.ipynb` or `xg_boost.ipynb`.
+3. Run the model notebooks, such as `SVM.ipynb` or `xg_boost.ipynb` in the `src/` folder.
 4. Compare validation and test results using the printed metrics and confusion matrices.
 
 Recommended order:
