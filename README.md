@@ -34,7 +34,7 @@ pip install numpy pandas matplotlib scikit-learn xgboost torch
 
 The `notebooks/` folder contains the experimental development process. These notebooks include exploratory trials using standard libraries such as scikit-learn, PyTorch, and XGBoost to compare methods, test preprocessing choices, and analyze model behavior.
 
-The `src/` folder contains the finalized implementation used for the formal version of the project. In particular, the final manual Linear SVM implementation and utility settings are placed under `src/`.
+The `src/` folder contains the finalized implementation used for the formal version of the project. In particular, the final manual Linear SVM implementation and XG-Boost are placed under `src/`.
 
 This separation is used to distinguish exploratory experiments from the final project implementation.
 
