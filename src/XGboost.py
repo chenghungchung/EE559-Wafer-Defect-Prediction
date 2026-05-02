@@ -1,22 +1,3 @@
-"""
-Basic NumPy XGBoost-style binary classifier for already-preprocessed tabular data.
-
-Expected data contract:
-- X_* contains no NaN / Inf values
-- y_* are binary labels in {0, 1}
-- preprocessing such as imputation / PCA is done upstream
-
-This file intentionally keeps only the core boosting path:
-- logistic loss
-- histogram-based tree splits
-- row subsampling and column subsampling
-- L2 regularization, split penalty, class weighting, threshold sweep
-
-Advanced extras used in earlier experiments such as SMOTE, focal loss, calibration,
-cascades, bagging, and polynomial expansion were removed to keep the implementation
-easy to inspect and tune.
-"""
-
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,19 +7,16 @@ import pickle
 import os
 import time
 
-
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
+CONFUSION_MATRIX_DIR = OUTPUT_DIR / "xgboost_confusion_matrices"
 DEFAULT_DATA_PATH = DATA_DIR / "preprocessed_data_outlier_pca.pkl"
-DEFAULT_DATASET_SUITE = [
-    DATA_DIR / "preprocessed_data.pkl",
-    DATA_DIR / "preprocessed_data_outlier.pkl",
-    DATA_DIR / "preprocessed_data_outlier_pca.pkl",
-    DATA_DIR / "preprocessed_data_outlier_vae_enhanced.pkl",
-]
+DEFAULT_DATASET_SUITE = [DATA_DIR / "preprocessed_data.pkl", DATA_DIR / "preprocessed_data_outlier_pca.pkl", DATA_DIR / "preprocessed_data_vae_enhanced.pkl"]
+SELECTION_MIN_ACCURACY = 0.0
+SELECTION_TARGET_RECALL = 0.80
+SELECTION_MAX_FALSE_ALARM_RATE = 0.50
+SELECTION_PRIMARY_METRIC = "recall_guard"
 
-# =========================
-# Loss Functions (Pluggable)
-# =========================
 class Loss:
     name: str = "base"
 
@@ -50,7 +28,6 @@ class Loss:
 
     def transform(self, y_pred_raw: np.ndarray) -> np.ndarray:
         return y_pred_raw
-
 
 class LogisticLoss(Loss):
     name = "logloss"
@@ -73,10 +50,6 @@ class LogisticLoss(Loss):
     def transform(self, y_pred_raw: np.ndarray) -> np.ndarray:
         return self._sigmoid(y_pred_raw)
 
-
-# =========
-# Metrics
-# =========
 class Metrics:
     @staticmethod
     def confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
@@ -112,18 +85,7 @@ class Metrics:
             "confusion_matrix": cm,
         }
 
-
 def compute_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    """
-    Compute ROC AUC from scratch using the rank-sum formulation.
-
-    This implementation:
-    - expects binary labels in {0, 1}
-    - expects probability-like scores where larger means more positive
-    - uses average ranks for tied scores
-
-    Returns NaN when AUC is undefined because only one class is present.
-    """
     y_true = np.asarray(y_true).reshape(-1).astype(np.int8)
     y_prob = np.asarray(y_prob).reshape(-1).astype(np.float64)
 
@@ -157,7 +119,6 @@ def compute_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
 
-
 def threshold_sweep_analysis(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -165,65 +126,24 @@ def threshold_sweep_analysis(
     stop: float = 0.50,
     step: float = 0.01,
 ) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
-    """
-    Sweep thresholds and compute precision / recall / F1 using NumPy only.
-
-    Returns:
-    - list of per-threshold metric dicts
-    - best-threshold dict selected by max F1, then precision, then recall
-    """
     y_true = np.asarray(y_true).reshape(-1).astype(np.int8)
     y_prob = np.asarray(y_prob).reshape(-1).astype(np.float64)
 
     thresholds = np.arange(start, stop + 0.5 * step, step, dtype=np.float64)
     rows: List[Dict[str, float]] = []
-    best_row: Optional[Dict[str, float]] = None
 
     for threshold in thresholds:
         y_pred = (y_prob >= threshold).astype(np.int8)
+        report = Metrics.classification_report(y_true, y_pred)
+        rows.append({"threshold": float(threshold), **{k: report[k] for k in ("precision", "recall", "f1")}})
+    default = {"threshold": float("nan"), "precision": float("nan"), "recall": float("nan"), "f1": float("nan")}
+    return rows, max(rows, key=lambda row: (row["f1"], row["precision"], row["recall"]), default=default)
 
-        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = 2.0 * precision * recall / max(1e-12, precision + recall)
-
-        row = {
-            "threshold": float(threshold),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-        }
-        rows.append(row)
-
-        if best_row is None or (
-            row["f1"],
-            row["precision"],
-            row["recall"],
-        ) > (
-            best_row["f1"],
-            best_row["precision"],
-            best_row["recall"],
-        ):
-            best_row = row
-
-    if best_row is None:
-        best_row = {"threshold": float("nan"), "precision": float("nan"), "recall": float("nan"), "f1": float("nan")}
-
-    return rows, best_row
-
-
-# =====================
-# Tree internal classes
-# =====================
 @dataclass
 class SplitCandidate:
     feature: int
     split_bin: int
     gain_raw: float
-
 
 @dataclass
 class TreeNode:
@@ -238,10 +158,7 @@ class TreeNode:
     left: Optional["TreeNode"] = None
     right: Optional["TreeNode"] = None
 
-
 class HistogramTree:
-    """Depthwise histogram tree for binary logistic boosting."""
-
     def __init__(
         self,
         max_depth: int,
@@ -284,7 +201,13 @@ class HistogramTree:
         all_idx = np.arange(n_samples, dtype=np.int32)
         self.root = self._build_depthwise(X_bins, grad, hess, all_idx, depth=0)
 
-    def _best_split(self, X_bins: np.ndarray, grad: np.ndarray, hess: np.ndarray, idx: np.ndarray) -> Optional[SplitCandidate]:
+    def _best_split(
+        self,
+        X_bins: np.ndarray,
+        grad: np.ndarray,
+        hess: np.ndarray,
+        idx: np.ndarray,
+    ) -> Optional[SplitCandidate]:
         if idx.size <= 1:
             return None
 
@@ -322,14 +245,26 @@ class HistogramTree:
 
         return best_split
 
-    def _split_indices(self, X_bins: np.ndarray, idx: np.ndarray, split: SplitCandidate) -> Tuple[np.ndarray, np.ndarray]:
+    def _split_indices(
+        self,
+        X_bins: np.ndarray,
+        idx: np.ndarray,
+        split: SplitCandidate,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         col = X_bins[idx, split.feature]
         left_mask = col <= split.split_bin
         if left_mask.sum() == 0 or left_mask.sum() == idx.size:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
         return idx[left_mask], idx[~left_mask]
 
-    def _build_depthwise(self, X_bins: np.ndarray, grad: np.ndarray, hess: np.ndarray, idx: np.ndarray, depth: int) -> TreeNode:
+    def _build_depthwise(
+        self,
+        X_bins: np.ndarray,
+        grad: np.ndarray,
+        hess: np.ndarray,
+        idx: np.ndarray,
+        depth: int,
+    ) -> TreeNode:
         G = float(grad[idx].sum())
         H = float(hess[idx].sum())
         node = TreeNode(True, self._leaf_value(G, H), G, H, depth)
@@ -378,13 +313,11 @@ class HistogramTree:
         self._predict_node(X_bins, np.arange(X_bins.shape[0]), self.root, out)
         return out
 
-
 @dataclass
 class TrainingLog:
     iteration: int
     train_loss: float
     valid_loss: Optional[float] = None
-
 
 class Booster:
     def __init__(
@@ -437,47 +370,37 @@ class Booster:
         self.base_margin_: float = 0.0
         self.resolved_scale_pos_weight_: float = float(scale_pos_weight)
 
-    # ====== Validation for preprocessed data ======
     @staticmethod
     def _assert_no_nan(X: np.ndarray, name: str) -> None:
         assert np.isfinite(X).all(), f"{name} must not contain NaN/Inf (preprocessing contract violated)."
 
     def _assert_binary_labels(self, y: np.ndarray, name: str) -> None:
         unique = np.unique(y)
-        assert np.array_equal(unique, np.array([0, 1])) or np.array_equal(unique, np.array([0])) or np.array_equal(unique, np.array([1])), (
-            f"{name} must contain only labels {{0,1}}; got {unique}."
+        valid_unique = (
+            np.array_equal(unique, np.array([0, 1]))
+            or np.array_equal(unique, np.array([0]))
+            or np.array_equal(unique, np.array([1]))
         )
+        assert valid_unique, f"{name} must contain only labels {{0,1}}; got {unique}."
 
-    # ====== Stable binning on scaled data ======
     def _build_bin_edges(self, X: np.ndarray) -> List[np.ndarray]:
-        """
-        Quantile binning remains valid on standardized data.
-        Standardization is monotonic per feature, so ordering/rank is preserved.
-        """
         quantiles = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]
         edges: List[np.ndarray] = []
         eps = 1e-12
 
         for j in range(X.shape[1]):
             col = X[:, j]
-            # Fix 1: near-constant features become non-splittable.
             if np.std(col) < 1e-8:
                 edges.append(np.array([], dtype=np.float64))
                 continue
 
-            q = np.quantile(col, quantiles)
+            q = np.unique(np.quantile(col, quantiles))
 
-            # Fix 4: remove duplicates from collapsed quantiles.
-            q = np.unique(q)
-
-            # Fix 4: if only one unique edge remains, treat as no-split feature.
             if q.size <= 1:
                 edges.append(np.array([], dtype=np.float64))
                 continue
 
-            # Fix 4: enforce strict monotonicity with tiny epsilon for stable searchsorted.
-            if q.size > 1:
-                q = np.maximum.accumulate(q + eps * np.arange(q.size))
+            q = np.maximum.accumulate(q + eps * np.arange(q.size))
             edges.append(q.astype(np.float64))
 
         return edges
@@ -507,8 +430,20 @@ class Booster:
         hess[pos] *= self.resolved_scale_pos_weight_
         return grad, hess
 
+    @staticmethod
+    def _best_f1_for_thresholds(
+        y_true: np.ndarray,
+        y_prob: np.ndarray,
+        thresholds: Tuple[float, ...] = (0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30),
+    ) -> float:
+        best_f1 = -1.0
+        for threshold in thresholds:
+            y_pred = (y_prob >= threshold).astype(np.int8)
+            report = Metrics.classification_report(y_true, y_pred)
+            best_f1 = max(best_f1, report["f1"])
+        return best_f1
+
     def fit(self, X: np.ndarray, y: np.ndarray, eval_set: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> "Booster":
-        # Required compatibility checks for already-preprocessed datasets.
         self._assert_no_nan(X, "X_train")
         self._assert_binary_labels(y, "y_train")
 
@@ -520,7 +455,6 @@ class Booster:
         self.best_iteration_ = None
         self.best_valid_loss_ = None
 
-        # Fix 2: explicit reset per fit call to avoid accumulation across refits.
         self.feature_importance_gain_ = np.zeros(n_features, dtype=np.float64)
         self.feature_importance_freq_ = np.zeros(n_features, dtype=np.float64)
 
@@ -542,7 +476,6 @@ class Booster:
             X_val, y_val = eval_set
             self._assert_no_nan(X_val, "X_val")
             self._assert_binary_labels(y_val, "y_val")
-            # Fix 3: ensure feature dimension consistency between train and validation.
             assert X_val.shape[1] == n_features, "Feature mismatch between training and validation."
             X_val_bins = self._transform_to_bins(X_val)
 
@@ -589,20 +522,9 @@ class Booster:
                 valid_loss = self.loss_fn.loss(y_val, pred_val_raw)
                 log.valid_loss = valid_loss
 
-                # Label-aware early stopping: monitor val F1 (sweep thresholds)
-                # instead of val log-loss, so the stopping criterion aligns with
-                # what we actually care about — separating defects from good wafers.
                 if self.early_stopping_metric == "f1":
                     p_val = self.loss_fn.transform(pred_val_raw)
-                    _f1_thresholds = [0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30]
-                    _best_f1_val = -1.0
-                    for _ft in _f1_thresholds:
-                        _yp = (p_val >= _ft).astype(np.int8)
-                        _rep = Metrics.classification_report(y_val, _yp)
-                        if _rep["f1"] > _best_f1_val:
-                            _best_f1_val = _rep["f1"]
-                    # Negate so "lower is better" convention is preserved
-                    monitor_val = -_best_f1_val
+                    monitor_val = -self._best_f1_for_thresholds(y_val, p_val)
                 else:
                     monitor_val = valid_loss
 
@@ -621,11 +543,17 @@ class Booster:
                             f"val_f1={-monitor_val:.4f} no_improve={rounds_no_improve}"
                         )
                     else:
-                        print(f"  train_loss={train_loss:.6f} valid_loss={valid_loss:.6f} no_improve={rounds_no_improve}")
+                        print(
+                            f"  train_loss={train_loss:.6f} valid_loss={valid_loss:.6f} "
+                            f"no_improve={rounds_no_improve}"
+                        )
 
                 if self.early_stopping_rounds is not None and rounds_no_improve >= self.early_stopping_rounds:
                     if self.verbose:
-                        print(f"Early stopping at iter={t}, best_iter={self.best_iteration_}, best_valid={best_valid:.6f}")
+                        print(
+                            f"Early stopping at iter={t}, best_iter={self.best_iteration_}, "
+                            f"best_valid={best_valid:.6f}"
+                        )
                     break
             else:
                 if self.verbose:
@@ -649,7 +577,6 @@ class Booster:
 
     def predict_raw(self, X: np.ndarray) -> np.ndarray:
         self._assert_no_nan(X, "X_predict")
-        # Fix 3: ensure feature dimension consistency between training and inference.
         assert self.bin_edges_ is not None, "Model is not fitted."
         assert X.shape[1] == len(self.bin_edges_), "Feature mismatch between training and inference."
         X_bins = self._transform_to_bins(X)
@@ -663,39 +590,30 @@ class Booster:
         return self.loss_fn.transform(raw)
 
     def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-        raw = self.predict_raw(X)
-        p = self.loss_fn.transform(raw)
-        return (p >= threshold).astype(np.int8)
+        return (self.predict_proba(X) >= threshold).astype(np.int8)
 
     def feature_importance(self, importance_type: str = "gain", normalize: bool = True) -> np.ndarray:
         if self.feature_importance_gain_ is None:
             raise RuntimeError("Model is not fitted.")
 
-        imp = self.feature_importance_freq_.copy() if importance_type == "weight" else self.feature_importance_gain_.copy()
+        imp = (
+            self.feature_importance_freq_.copy()
+            if importance_type == "weight"
+            else self.feature_importance_gain_.copy()
+        )
         if normalize:
             s = imp.sum()
             if s > 0:
                 imp /= s
         return imp
 
-
 class XGBoost(Booster):
-    """Alias for backwards-compatible API name."""
+    pass
 
-
-SEARCH_MODEL_KWARGS = {
-    "auto_scale_pos_weight": False,
-    "base_score": None,
-    "early_stopping_rounds": None,
-    "early_stopping_metric": "loss",
-    "random_state": 42,
-    "verbose": False,
-}
-
+SEARCH_MODEL_KWARGS = dict(auto_scale_pos_weight=False, base_score=None, early_stopping_rounds=None, early_stopping_metric="loss", random_state=42, verbose=False)
 
 def _make_search_model(model_params: Dict[str, object]) -> XGBoost:
     return XGBoost(**SEARCH_MODEL_KWARGS, **model_params)
-
 
 def _evaluate_probabilities(
     y_true: np.ndarray,
@@ -707,217 +625,37 @@ def _evaluate_probabilities(
     auc = compute_auc(y_true, y_prob)
     return report, auc
 
-
-def _evaluate_model_split(
-    model: XGBoost,
-    X: np.ndarray,
-    y: np.ndarray,
-    threshold: float,
-) -> Tuple[np.ndarray, Dict[str, float], float]:
-    y_prob = model.predict_proba(X)
-    report, auc = _evaluate_probabilities(y, y_prob, threshold)
-    return y_prob, report, auc
-
-
 def _build_search_presets() -> List[Dict[str, object]]:
-    return [
-        dict(
-            name="nb_depth3_300",
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=3,
-            min_child_weight=3.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.0,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_depth3_500",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=5.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.1,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_depth4_500",
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=4,
-            min_child_weight=3.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.1,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_depth5_500",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=5,
-            min_child_weight=3.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.1,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_depth4_800",
-            n_estimators=800,
-            learning_rate=0.03,
-            max_depth=4,
-            min_child_weight=1.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.2,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_depth5_800",
-            n_estimators=800,
-            learning_rate=0.02,
-            max_depth=5,
-            min_child_weight=5.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.2,
-            scale_pos_weight=14.01369863,
-            n_bins=64,
-        ),
-        dict(
-            name="nb_best233_spw28",
-            n_estimators=233,
-            learning_rate=0.03,
-            max_depth=5,
-            min_child_weight=3.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=3.0,
-            gamma=0.1,
-            scale_pos_weight=28.02739726,
-            n_bins=64,
-        ),
-        dict(
-            name="balanced_d2_spw1",
-            n_estimators=800,
-            learning_rate=0.02,
-            max_depth=2,
-            min_child_weight=5.0,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_lambda=8.0,
-            gamma=0.0,
-            scale_pos_weight=1.0,
-            n_bins=64,
-        ),
-        dict(
-            name="balanced_d3_spw2",
-            n_estimators=600,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=5.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=6.0,
-            gamma=0.1,
-            scale_pos_weight=2.0,
-            n_bins=64,
-        ),
-        dict(
-            name="guarded_recall_spw4",
-            n_estimators=600,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=6.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=8.0,
-            gamma=0.2,
-            scale_pos_weight=4.0,
-            n_bins=64,
-        ),
-        dict(
-            name="mid_spw6_d3",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=5.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=6.0,
-            gamma=0.15,
-            scale_pos_weight=6.0,
-            n_bins=64,
-        ),
-        dict(
-            name="mid_spw8_d3",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=5.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=6.0,
-            gamma=0.15,
-            scale_pos_weight=8.0,
-            n_bins=64,
-        ),
-        dict(
-            name="mid_spw10_d3",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=3,
-            min_child_weight=5.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=6.0,
-            gamma=0.15,
-            scale_pos_weight=10.0,
-            n_bins=64,
-        ),
-        dict(
-            name="f1_d3_spw12",
-            n_estimators=600,
-            learning_rate=0.025,
-            max_depth=3,
-            min_child_weight=6.0,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=8.0,
-            gamma=0.2,
-            scale_pos_weight=12.0,
-            n_bins=64,
-        ),
-        dict(
-            name="precision_d4_spw1",
-            n_estimators=500,
-            learning_rate=0.03,
-            max_depth=4,
-            min_child_weight=5.0,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=10.0,
-            gamma=0.2,
-            scale_pos_weight=1.0,
-            n_bins=64,
-        ),
+    nb_base = dict(subsample=0.8, colsample_bytree=0.8, reg_lambda=3.0, scale_pos_weight=14.01369863, n_bins=64)
+    balanced_base = dict(
+        n_estimators=500,
+        learning_rate=0.03,
+        max_depth=3,
+        min_child_weight=5.0,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_lambda=6.0,
+        gamma=0.15,
+        n_bins=64,
+    )
+    specs = [
+        ("nb_depth3_300", nb_base, dict(n_estimators=300, learning_rate=0.05, max_depth=3, min_child_weight=3.0, gamma=0.0)),
+        ("nb_depth3_500", nb_base, dict(n_estimators=500, learning_rate=0.03, max_depth=3, min_child_weight=5.0, gamma=0.1)),
+        ("nb_depth4_500", nb_base, dict(n_estimators=500, learning_rate=0.05, max_depth=4, min_child_weight=3.0, gamma=0.1)),
+        ("nb_depth5_500", nb_base, dict(n_estimators=500, learning_rate=0.03, max_depth=5, min_child_weight=3.0, gamma=0.1)),
+        ("nb_depth4_800", nb_base, dict(n_estimators=800, learning_rate=0.03, max_depth=4, min_child_weight=1.0, gamma=0.2)),
+        ("nb_depth5_800", nb_base, dict(n_estimators=800, learning_rate=0.02, max_depth=5, min_child_weight=5.0, gamma=0.2)),
+        ("nb_best233_spw28", nb_base, dict(n_estimators=233, learning_rate=0.03, max_depth=5, min_child_weight=3.0, gamma=0.1, scale_pos_weight=28.02739726)),
+        ("balanced_d2_spw1", balanced_base, dict(n_estimators=800, learning_rate=0.02, max_depth=2, subsample=0.9, colsample_bytree=0.9, reg_lambda=8.0, gamma=0.0, scale_pos_weight=1.0)),
+        ("balanced_d3_spw2", balanced_base, dict(n_estimators=600, gamma=0.1, scale_pos_weight=2.0)),
+        ("guarded_recall_spw4", balanced_base, dict(n_estimators=600, min_child_weight=6.0, reg_lambda=8.0, gamma=0.2, scale_pos_weight=4.0)),
+        ("mid_spw6_d3", balanced_base, dict(scale_pos_weight=6.0)),
+        ("mid_spw8_d3", balanced_base, dict(scale_pos_weight=8.0)),
+        ("mid_spw10_d3", balanced_base, dict(scale_pos_weight=10.0)),
+        ("f1_d3_spw12", balanced_base, dict(n_estimators=600, learning_rate=0.025, min_child_weight=6.0, reg_lambda=8.0, gamma=0.2, scale_pos_weight=12.0)),
+        ("precision_d4_spw1", balanced_base, dict(max_depth=4, subsample=0.8, colsample_bytree=0.8, reg_lambda=10.0, gamma=0.2, scale_pos_weight=1.0)),
     ]
-
+    return [{"name": name, **base, **overrides} for name, base, overrides in specs]
 
 def train_and_evaluate_preprocessed(
     X_train: np.ndarray,
@@ -927,34 +665,16 @@ def train_and_evaluate_preprocessed(
     X_test: np.ndarray,
     y_test: np.ndarray,
 ) -> Dict[str, float]:
-    """Example helper for externally preprocessed dataset usage."""
-    model = XGBoost(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=5,
-        min_child_weight=2.0,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        gamma=0.1,
-        n_bins=64,
-        scale_pos_weight=1.0,
-        early_stopping_rounds=20,
-        random_state=42,
-        verbose=True,
-    )
-
+    model = XGBoost(n_estimators=300, learning_rate=0.05, max_depth=5, min_child_weight=2.0, subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, gamma=0.1, n_bins=64, scale_pos_weight=1.0, early_stopping_rounds=20, random_state=42, verbose=True)
     model.fit(X_train, y_train, eval_set=(X_val, y_val))
     y_pred = model.predict(X_test)
     return Metrics.classification_report(y_test, y_pred)
-
 
 def _as_numpy(name: str, arr, verbose: bool = False) -> np.ndarray:
     out = np.asarray(arr)
     if verbose:
         print(f"{name}: shape={out.shape}, dtype={out.dtype}")
     return out
-
 
 def _normalize_binary_labels(y: np.ndarray, name: str, verbose: bool = False) -> np.ndarray:
     y = np.asarray(y).reshape(-1)
@@ -965,14 +685,9 @@ def _normalize_binary_labels(y: np.ndarray, name: str, verbose: bool = False) ->
         y = ((y + 1) // 2).astype(np.int8)
     return y.astype(np.int8)
 
-
 def _detect_key(d: dict, candidates: List[str]):
     lower_map = {str(k).lower(): k for k in d.keys()}
-    for c in candidates:
-        if c in lower_map:
-            return lower_map[c]
-    return None
-
+    return next((lower_map[c] for c in candidates if c in lower_map), None)
 
 def _extract_splits(data_obj):
     X_train = y_train = X_val = y_val = X_test = y_test = None
@@ -997,33 +712,132 @@ def _extract_splits(data_obj):
         else:
             arrays = [v for v in data_obj.values() if hasattr(v, "shape") or isinstance(v, (list, tuple))]
             if len(arrays) >= 2:
-                X_train, y_train = arrays[0], arrays[1]
+                X_train, y_train = arrays[:2]
             if len(arrays) >= 4:
-                X_val, y_val = arrays[2], arrays[3]
+                X_val, y_val = arrays[2:4]
             if len(arrays) >= 6:
-                X_test, y_test = arrays[4], arrays[5]
+                X_test, y_test = arrays[4:6]
     elif isinstance(data_obj, (list, tuple)):
         if len(data_obj) >= 2:
-            X_train, y_train = data_obj[0], data_obj[1]
+            X_train, y_train = data_obj[:2]
         if len(data_obj) >= 4:
-            X_val, y_val = data_obj[2], data_obj[3]
+            X_val, y_val = data_obj[2:4]
         if len(data_obj) >= 6:
-            X_test, y_test = data_obj[4], data_obj[5]
+            X_test, y_test = data_obj[4:6]
 
     if X_train is None or y_train is None:
         raise ValueError("Could not auto-detect X_train/y_train from the pickle payload.")
 
     return X_train, y_train, X_val, y_val, X_test, y_test
 
+@dataclass
+class DatasetBundle:
+    path: str
+    name: str
+    data_obj: object
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_val: Optional[np.ndarray]
+    y_val: Optional[np.ndarray]
+    X_test: Optional[np.ndarray]
+    y_test: Optional[np.ndarray]
+    feature_names: List[str]
+    note: str = ""
+    n_components: Optional[int] = None
+    explained_var: Optional[float] = None
+
+    @property
+    def has_eval(self) -> bool: return self.X_val is not None and self.y_val is not None
+
+    @property
+    def has_test(self) -> bool: return self.X_test is not None and self.y_test is not None
+
+def _load_pickle_payload(path: Union[str, Path]) -> Tuple[str, str, object]:
+    path_str = os.fspath(path)
+    if not os.path.exists(path_str):
+        raise FileNotFoundError(f"Could not find file: {path_str}")
+
+    with open(path_str, "rb") as f:
+        data_obj = pickle.load(f)
+
+    return path_str, os.path.basename(path_str), data_obj
+
+def _payload_metadata(data_obj: object) -> Tuple[str, Optional[int], Optional[float]]:
+    if not isinstance(data_obj, dict): return "", None, None
+    return data_obj.get("note", ""), data_obj.get("n_components", None), data_obj.get("explained_variance", None)
+
+def _print_raw_payload_info(dataset_name: str, data_obj: object) -> None:
+    print(f"\nDataset: {dataset_name}")
+    print("Raw data")
+    print("  type:", type(data_obj))
+    if not isinstance(data_obj, dict):
+        return
+
+    print("  keys:", list(data_obj.keys()))
+    for k, v in data_obj.items():
+        if hasattr(v, "shape"):
+            print(f"  {k}: shape={v.shape}, dtype={getattr(v, 'dtype', '?')}")
+        elif not isinstance(v, (np.ndarray, list)):
+            print(f"  {k}: {v}")
+
+def _feature_names_for(data_obj: object, n_features: int) -> List[str]:
+    prefix = "PC" if isinstance(data_obj, dict) and data_obj.get("n_components") is not None else "feat_"
+    return [f"{prefix}{i + 1}" if prefix == "PC" else f"{prefix}{i}" for i in range(n_features)]
+
+def _load_dataset_bundle(path: Union[str, Path], verbose: bool = False) -> DatasetBundle:
+    path_str, dataset_name, data_obj = _load_pickle_payload(path)
+    note, n_components, explained_var = _payload_metadata(data_obj)
+
+    if verbose:
+        _print_raw_payload_info(dataset_name, data_obj)
+
+    X_train, y_train, X_val, y_val, X_test, y_test = _extract_splits(data_obj)
+    X_train = _as_numpy("X_train", X_train, verbose=verbose)
+    y_train = _normalize_binary_labels(_as_numpy("y_train", y_train, verbose=verbose), "y_train", verbose=verbose)
+
+    if X_val is not None and y_val is not None:
+        X_val = _as_numpy("X_val", X_val, verbose=verbose)
+        y_val = _normalize_binary_labels(_as_numpy("y_val", y_val, verbose=verbose), "y_val", verbose=verbose)
+
+    if X_test is not None and y_test is not None:
+        X_test = _as_numpy("X_test", X_test, verbose=verbose)
+        y_test = _normalize_binary_labels(_as_numpy("y_test", y_test, verbose=verbose), "y_test", verbose=verbose)
+
+    return DatasetBundle(
+        path=path_str,
+        name=dataset_name,
+        data_obj=data_obj,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        X_test=X_test,
+        y_test=y_test,
+        feature_names=_feature_names_for(data_obj, X_train.shape[1]),
+        note=note,
+        n_components=n_components,
+        explained_var=explained_var,
+    )
+
+def _print_dataset_summary(dataset: DatasetBundle, verbose: bool = False) -> None:
+    print("\n" + "=" * 120)
+    print(f"Dataset: {dataset.name}")
+    print(f"  {_split_summary('train', dataset.X_train, dataset.y_train)}")
+    if dataset.has_eval:
+        print(f"  {_split_summary('val', dataset.X_val, dataset.y_val)}")
+    if dataset.has_test:
+        print(f"  {_split_summary('test', dataset.X_test, dataset.y_test)}")
+    if dataset.note:
+        print(f"  note: {dataset.note}")
+    if dataset.n_components is not None:
+        print(f"  pca components: {dataset.n_components}")
+    if dataset.explained_var is not None:
+        print(f"  explained variance: {float(dataset.explained_var):.4f}")
+
+    if verbose:
+        _print_feature_summary(dataset.X_train, dataset.feature_names)
 
 def _performance_band(report: Optional[Dict[str, float]]) -> Tuple[str, str]:
-    """
-    Context-specific quality bands for this defect-detection task.
-
-    Because the dataset is highly imbalanced, accuracy is treated as a floor
-    rather than the main driver. We mainly reward recall first, then require
-    precision / F1 to be high enough for the model to be practical.
-    """
     if report is None:
         return "n/a", "no report"
 
@@ -1040,12 +854,10 @@ def _performance_band(report: Optional[Dict[str, float]]) -> Tuple[str, str]:
         return "usable", "directionally useful, but still noisy"
     return "weak", "still too noisy or misses too many positives"
 
-
 def _split_summary(name: str, X: np.ndarray, y: np.ndarray) -> str:
     positives = int(np.sum(y == 1))
     negatives = int(np.sum(y == 0))
     return f"{name}: {X.shape[0]} x {X.shape[1]} (pos={positives}, neg={negatives})"
-
 
 def _format_metric_line(report: Dict[str, float], auc: float) -> str:
     text = (
@@ -1059,24 +871,14 @@ def _format_metric_line(report: Dict[str, float], auc: float) -> str:
     text += f" fn={int(report['fn'])} miss={report['miss_rate']:.4f}"
     return text
 
-
 def _format_table_number(value: float, width: int = 6) -> str:
-    if value is None or np.isnan(float(value)):
-        return f"{'N/A':>{width}}"
-    return f"{float(value):>{width}.3f}"
-
+    return f"{'N/A':>{width}}" if value is None or np.isnan(float(value)) else f"{float(value):>{width}.3f}"
 
 def _format_table_metric(report: Optional[Dict[str, float]], key: str, width: int = 6) -> str:
-    if report is None:
-        return f"{'N/A':>{width}}"
-    return _format_table_number(float(report[key]), width=width)
-
+    return f"{'N/A':>{width}}" if report is None else _format_table_number(float(report[key]), width=width)
 
 def _format_table_count(report: Optional[Dict[str, float]], key: str, width: int = 4) -> str:
-    if report is None:
-        return f"{'N/A':>{width}}"
-    return f"{int(report[key]):>{width}}"
-
+    return f"{'N/A':>{width}}" if report is None else f"{int(report[key]):>{width}}"
 
 def _print_experiment_table(search_results: List[Dict[str, object]]) -> None:
     print("Experiment results")
@@ -1105,7 +907,6 @@ def _print_experiment_table(search_results: List[Dict[str, object]]) -> None:
             f"{str(grade):>8}"
         )
 
-
 def _print_defect_safety_table(search_results: List[Dict[str, object]]) -> None:
     print("\nDefect-safety view")
     print(
@@ -1127,7 +928,6 @@ def _print_defect_safety_table(search_results: List[Dict[str, object]]) -> None:
             f"{_format_table_metric(test_report, 'false_alarm_rate')}"
         )
 
-
 def _print_feature_summary(X: np.ndarray, feature_names: List[str]) -> None:
     print(f"\nFeature summary ({X.shape[0]} samples x {X.shape[1]} features)")
     print(f"{'Feature':<10} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}  {'Skew':>8}")
@@ -1143,7 +943,6 @@ def _print_feature_summary(X: np.ndarray, feature_names: List[str]) -> None:
             f"{min_value:>10.4f} {max_value:>10.4f}  {skew:>8.3f}"
         )
 
-
 def _search_result_key(
     item: Dict[str, object],
     policy: str,
@@ -1154,56 +953,19 @@ def _search_result_key(
     report = item["val_report"]
     if report is None:
         return (float("-inf"),)
-
+    r = report
+    if policy == "selected" and item.get("selection_policy") == "recall_guard":
+        return (int(r["recall"] >= target_recall), int(r["false_alarm_rate"] <= max_false_alarm_rate), int(item["meets_target"]), r["recall"], -r["false_alarm_rate"], r["precision"], r["f1"], r["accuracy"])
     if policy == "selected":
-        if item.get("selection_policy") == "recall_guard":
-            return (
-                1 if report["recall"] >= target_recall else 0,
-                1 if report["false_alarm_rate"] <= max_false_alarm_rate else 0,
-                1 if item["meets_target"] else 0,
-                report["recall"],
-                -report["false_alarm_rate"],
-                report["precision"],
-                report["f1"],
-                report["accuracy"],
-            )
-        return (
-            1 if item["meets_target"] else 0,
-            report["recall"],
-            report["precision"],
-            report["f1"],
-            report["accuracy"],
-        )
-
-    if policy == "recall":
-        return (
-            1 if report["accuracy"] >= min_accuracy else 0,
-            report["recall"],
-            report["precision"],
-            report["f1"],
-            report["accuracy"],
-        )
-
-    if policy == "balanced":
-        return (
-            1 if report["accuracy"] >= min_accuracy else 0,
-            report["f1"],
-            report["recall"],
-            report["precision"],
-            report["accuracy"],
-        )
-
-    if policy == "precision":
-        return (
-            1 if report["accuracy"] >= min_accuracy else 0,
-            1 if report["recall"] >= 0.25 else 0,
-            report["precision"],
-            report["f1"],
-            report["accuracy"],
-        )
-
-    raise ValueError(f"Unknown search policy: {policy}")
-
+        return (int(item["meets_target"]), r["recall"], r["precision"], r["f1"], r["accuracy"])
+    keys = {
+        "recall": (int(r["accuracy"] >= min_accuracy), r["recall"], r["precision"], r["f1"], r["accuracy"]),
+        "balanced": (int(r["accuracy"] >= min_accuracy), r["f1"], r["recall"], r["precision"], r["accuracy"]),
+        "precision": (int(r["accuracy"] >= min_accuracy), int(r["recall"] >= 0.25), r["precision"], r["f1"], r["accuracy"]),
+    }
+    if policy not in keys:
+        raise ValueError(f"Unknown search policy: {policy}")
+    return keys[policy]
 
 def _print_notable_results(search_results: List[Dict[str, object]], min_accuracy: float) -> None:
     picks = [
@@ -1221,7 +983,6 @@ def _print_notable_results(search_results: List[Dict[str, object]], min_accuracy
             f"AUC={item['val_auc']:.3f}  grade={item['val_band']}"
         )
 
-
 def _print_threshold_reference(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -1231,12 +992,8 @@ def _print_threshold_reference(
     for threshold in thresholds:
         y_pred = (y_prob >= threshold).astype(np.int8)
         report = Metrics.classification_report(y_true, y_pred)
-        meets_goal = "✓" if report["precision"] >= 0.50 and report["recall"] >= 0.50 else ""
-        print(
-            f"{threshold:>10.2f} {report['accuracy']:>10.4f} {report['precision']:>10.4f} "
-            f"{report['recall']:>8.4f} {report['f1']:>8.4f} {meets_goal:>14}"
-        )
-
+        meets_goal = "yes" if report["precision"] >= 0.50 and report["recall"] >= 0.50 else ""
+        print(f"{threshold:>10.2f} {report['accuracy']:>10.4f} {report['precision']:>10.4f} {report['recall']:>8.4f} {report['f1']:>8.4f} {meets_goal:>14}")
 
 def _print_threshold_sweep(
     y_true: np.ndarray,
@@ -1249,185 +1006,148 @@ def _print_threshold_sweep(
     print("\nThreshold sweep")
     print(f"{'Threshold':>10} {'Precision':>10} {'Recall':>8} {'F1':>8}")
     for row in sweep_rows:
-        print(
-            f"{row['threshold']:>10.2f} {row['precision']:>10.4f} "
-            f"{row['recall']:>8.4f} {row['f1']:>8.4f}"
-        )
+        print(f"{row['threshold']:>10.2f} {row['precision']:>10.4f} {row['recall']:>8.4f} {row['f1']:>8.4f}")
 
     print("\nBest threshold by F1:")
-    print(f"  threshold = {best_sweep['threshold']:.2f}")
-    print(f"  precision = {best_sweep['precision']:.4f}")
-    print(f"  recall    = {best_sweep['recall']:.4f}")
-    print(f"  f1        = {best_sweep['f1']:.4f}")
+    print(f"  threshold = {best_sweep['threshold']:.2f}\n  precision = {best_sweep['precision']:.4f}\n  recall    = {best_sweep['recall']:.4f}\n  f1        = {best_sweep['f1']:.4f}")
 
+def _load_pyplot():
+    for env_name, folder in {"MPLCONFIGDIR": ".matplotlib", "XDG_CACHE_HOME": ".cache"}.items():
+        path = OUTPUT_DIR / folder
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault(env_name, os.fspath(path))
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
 
-def _load_and_train_from_pickle(
-    path: Union[str, Path] = DEFAULT_DATA_PATH,
-    verbose: bool = False,
+def _safe_filename_stem(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in Path(name).stem) or "dataset"
+
+def _plot_confusion_matrix(report: Optional[Dict[str, float]], dataset_name: str, output_dir: Union[str, Path]) -> Optional[Path]:
+    if report is None or "confusion_matrix" not in report:
+        return None
+    try:
+        plt = _load_pyplot()
+    except ImportError:
+        print("  confusion matrix plot skipped: matplotlib is not installed")
+        return None
+    cm = np.asarray(report["confusion_matrix"], dtype=np.int64)
+    fig, ax = plt.subplots(figsize=(5.8, 5.0))
+    image = ax.imshow(cm, cmap="Blues")
+    ax.set_title(f"{dataset_name} test confusion matrix")
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_xticks([0, 1], labels=["0 normal", "1 defect"])
+    ax.set_yticks([0, 1], labels=["0 normal", "1 defect"])
+    threshold = 0.55 * max(1, int(cm.max()))
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color="white" if cm[i, j] > threshold else "black", fontsize=14, fontweight="bold")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    output_path = Path(output_dir) / f"{_safe_filename_stem(dataset_name)}_confusion_matrix.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+def _search_thresholds() -> List[float]: return [float(t) for t in np.arange(0.01, 0.801, 0.005)]
+
+def _run_search_preset(
+    dataset: DatasetBundle,
+    config: Dict[str, object],
+    thresholds: List[float],
 ) -> Dict[str, object]:
-    path = os.fspath(path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Could not find file: {path}")
+    name = config["name"]
+    model_params = {k: v for k, v in config.items() if k != "name"}
+    t0 = time.perf_counter()
+    model = _make_search_model(model_params)
+    model.fit(dataset.X_train, dataset.y_train, eval_set=(dataset.X_val, dataset.y_val) if dataset.has_eval else None)
+    train_sec = time.perf_counter() - t0
 
-    dataset_name = os.path.basename(path)
-
-    with open(path, "rb") as f:
-        data_obj = pickle.load(f)
-
-    note = ""
-    n_components = None
-    explained_var = None
-    if isinstance(data_obj, dict):
-        note = data_obj.get("note", "")
-        n_components = data_obj.get("n_components", None)
-        explained_var = data_obj.get("explained_variance", None)
-
-    if verbose:
-        print(f"\nDataset: {dataset_name}")
-        print("Raw data")
-        print("  type:", type(data_obj))
-        if isinstance(data_obj, dict):
-            print("  keys:", list(data_obj.keys()))
-            for k, v in data_obj.items():
-                if hasattr(v, "shape"):
-                    print(f"  {k}: shape={v.shape}, dtype={getattr(v, 'dtype', '?')}")
-                elif not isinstance(v, (np.ndarray, list)):
-                    print(f"  {k}: {v}")
-
-    X_train, y_train, X_val, y_val, X_test, y_test = _extract_splits(data_obj)
-
-    X_train = _as_numpy("X_train", X_train, verbose=verbose)
-    y_train = _normalize_binary_labels(_as_numpy("y_train", y_train, verbose=verbose), "y_train", verbose=verbose)
-
-    if X_val is not None and y_val is not None:
-        X_val = _as_numpy("X_val", X_val, verbose=verbose)
-        y_val = _normalize_binary_labels(_as_numpy("y_val", y_val, verbose=verbose), "y_val", verbose=verbose)
-
-    if X_test is not None and y_test is not None:
-        X_test = _as_numpy("X_test", X_test, verbose=verbose)
-        y_test = _normalize_binary_labels(_as_numpy("y_test", y_test, verbose=verbose), "y_test", verbose=verbose)
-
-    print("\n" + "=" * 120)
-    print(f"Dataset: {dataset_name}")
-    print(f"  {_split_summary('train', X_train, y_train)}")
-    if X_val is not None and y_val is not None:
-        print(f"  {_split_summary('val', X_val, y_val)}")
-    if X_test is not None and y_test is not None:
-        print(f"  {_split_summary('test', X_test, y_test)}")
-    if note:
-        print(f"  note: {note}")
-    if n_components is not None:
-        print(f"  pca components: {n_components}")
-    if explained_var is not None:
-        print(f"  explained variance: {float(explained_var):.4f}")
-
-    n_feat = X_train.shape[1]
-    if isinstance(data_obj, dict) and data_obj.get("n_components") is not None:
-        feat_names = [f"PC{i + 1}" for i in range(n_feat)]
+    if dataset.has_eval:
+        val_prob = model.predict_proba(dataset.X_val)
+        best_t, _, meets = _best_threshold(
+            dataset.y_val,
+            val_prob,
+            thresholds,
+            min_accuracy=SELECTION_MIN_ACCURACY,
+            min_recall=SELECTION_TARGET_RECALL,
+            max_false_alarm_rate=SELECTION_MAX_FALSE_ALARM_RATE,
+            primary_metric=SELECTION_PRIMARY_METRIC,
+        )
+        val_report, val_auc = _evaluate_probabilities(dataset.y_val, val_prob, best_t)
+        val_band, _ = _performance_band(val_report)
     else:
-        feat_names = [f"feat_{i}" for i in range(n_feat)]
+        best_t = 0.50
+        meets = False
+        val_report = None
+        val_band = "n/a"
+        val_auc = float("nan")
 
-    if verbose:
-        _print_feature_summary(X_train, feat_names)
+    test_report = None
+    test_band = "n/a"
+    test_auc = float("nan")
+    if dataset.has_test:
+        test_report, test_auc = _evaluate_probabilities(dataset.y_test, model.predict_proba(dataset.X_test), best_t)
+        test_band, _ = _performance_band(test_report)
 
-    has_eval = X_val is not None and y_val is not None
-    thresholds = [float(t) for t in np.arange(0.01, 0.801, 0.005)]
-    selection_min_accuracy = 0.0
-    selection_target_recall = 0.80
-    selection_max_false_alarm_rate = 0.50
-    selection_primary_metric = "recall_guard"
+    return {
+        "name": name,
+        "params": model_params,
+        "threshold": best_t,
+        "meets_target": meets,
+        "selection_policy": SELECTION_PRIMARY_METRIC,
+        "target_recall": SELECTION_TARGET_RECALL,
+        "max_false_alarm_rate": SELECTION_MAX_FALSE_ALARM_RATE,
+        "best_iteration": model.best_iteration_,
+        "train_sec": train_sec,
+        "val_report": val_report,
+        "val_band": val_band,
+        "val_auc": val_auc,
+        "test_report": test_report,
+        "test_band": test_band,
+        "test_auc": test_auc,
+    }
 
+def _run_search(
+    dataset: DatasetBundle,
+    thresholds: List[float],
+) -> List[Dict[str, object]]:
     param_grid = _build_search_presets()
-
     print(
         f"  trying {len(param_grid)} preset settings "
-        f"(selection: {selection_primary_metric}, target val recall={selection_target_recall:.2f}, "
-        f"max val false alarm={selection_max_false_alarm_rate:.2f})"
+        f"(selection: {SELECTION_PRIMARY_METRIC}, target val recall={SELECTION_TARGET_RECALL:.2f}, "
+        f"max val false alarm={SELECTION_MAX_FALSE_ALARM_RATE:.2f})"
+    )
+    return [_run_search_preset(dataset, config, thresholds) for config in param_grid]
+
+def _select_best_search_result(
+    search_results: List[Dict[str, object]],
+    has_eval: bool,
+) -> Dict[str, object]:
+    return search_results[0] if not has_eval else max(
+        search_results,
+        key=lambda item: _search_result_key(
+            item,
+            "selected",
+            SELECTION_MIN_ACCURACY,
+            target_recall=SELECTION_TARGET_RECALL,
+            max_false_alarm_rate=SELECTION_MAX_FALSE_ALARM_RATE,
+        ),
     )
 
-    search_results = []
-    for idx, config in enumerate(param_grid, start=1):
-        name = config["name"]
-        model_params = {k: v for k, v in config.items() if k != "name"}
-        t0 = time.perf_counter()
-        model = _make_search_model(model_params)
-        model.fit(X_train, y_train, eval_set=(X_val, y_val) if has_eval else None)
-        train_sec = time.perf_counter() - t0
-
-        if has_eval:
-            val_prob = model.predict_proba(X_val)
-            best_t, _, meets = _best_threshold(
-                y_val,
-                val_prob,
-                thresholds,
-                min_accuracy=selection_min_accuracy,
-                min_recall=selection_target_recall,
-                max_false_alarm_rate=selection_max_false_alarm_rate,
-                primary_metric=selection_primary_metric,
-            )
-            val_report, val_auc = _evaluate_probabilities(y_val, val_prob, best_t)
-            val_band, _ = _performance_band(val_report)
-        else:
-            best_t = 0.50
-            meets = False
-            val_report = None
-            val_band = "n/a"
-            val_auc = float("nan")
-
-        test_report = None
-        test_band = "n/a"
-        test_auc = float("nan")
-        if X_test is not None and y_test is not None:
-            _, test_report, test_auc = _evaluate_model_split(model, X_test, y_test, best_t)
-            test_band, _ = _performance_band(test_report)
-
-        search_results.append(
-            {
-                "name": name,
-                "params": model_params,
-                "threshold": best_t,
-                "meets_target": meets,
-                "selection_policy": selection_primary_metric,
-                "target_recall": selection_target_recall,
-                "max_false_alarm_rate": selection_max_false_alarm_rate,
-                "best_iteration": model.best_iteration_,
-                "train_sec": train_sec,
-                "val_report": val_report,
-                "val_band": val_band,
-                "val_auc": val_auc,
-                "test_report": test_report,
-                "test_band": test_band,
-                "test_auc": test_auc,
-            }
-        )
-
-    if has_eval:
-        best_result = max(
-            search_results,
-            key=lambda item: _search_result_key(
-                item,
-                "selected",
-                selection_min_accuracy,
-                target_recall=selection_target_recall,
-                max_false_alarm_rate=selection_max_false_alarm_rate,
-            ),
-        )
-    else:
-        best_result = search_results[0]
-
-    _print_experiment_table(search_results)
-    _print_defect_safety_table(search_results)
-
-    if verbose and has_eval:
-        _print_notable_results(search_results, selection_min_accuracy)
-
+def _print_best_result(
+    best_result: Dict[str, object],
+    has_eval: bool,
+    verbose: bool = False,
+) -> None:
     print("\nBest by current rule")
     print(
         f"  preset: {best_result['name']} | "
         f"threshold={best_result['threshold']:.2f} | "
         f"time={best_result['train_sec']:.2f}s | "
-        f"target_recall={selection_target_recall:.2f} | "
-        f"max_false_alarm={selection_max_false_alarm_rate:.2f} | "
+        f"target_recall={SELECTION_TARGET_RECALL:.2f} | "
+        f"max_false_alarm={SELECTION_MAX_FALSE_ALARM_RATE:.2f} | "
         f"target_met={best_result['meets_target']}"
     )
     if verbose:
@@ -1436,77 +1156,99 @@ def _load_and_train_from_pickle(
         vr = best_result["val_report"]
         print(f"  validation: {_format_metric_line(vr, best_result['val_auc'])} | {best_result['val_band']}")
 
-    if X_test is None or y_test is None:
-        print("  test: skipped")
-        return {
-            "dataset": dataset_name,
-            "path": path,
-            "best_preset": best_result["name"],
-            "best_params": best_result["params"],
-            "threshold": best_result["threshold"],
-            "selection_policy": selection_primary_metric,
-            "target_recall": selection_target_recall,
-            "max_false_alarm_rate": selection_max_false_alarm_rate,
-            "target_met": best_result["meets_target"],
-            "train_sec": best_result["train_sec"],
-            "val_report": best_result["val_report"],
-            "val_band": best_result["val_band"],
-            "val_auc": best_result["val_auc"],
-            "test_report": None,
-            "test_band": "n/a",
-            "test_auc": float("nan"),
-        }
-
-    tr = best_result["test_report"]
-    test_band, test_note = _performance_band(tr)
-    print(f"  test: {_format_metric_line(tr, best_result['test_auc'])} | {test_band}")
-    print(f"  test cm: {tr['confusion_matrix'].tolist()}")
-    if verbose:
-        print(f"  note: {test_note}")
-
-    if verbose:
-        analysis_model = _make_search_model(best_result["params"])
-        analysis_model.fit(X_train, y_train, eval_set=(X_val, y_val) if has_eval else None)
-        analysis_test_prob = analysis_model.predict_proba(X_test)
-        if tr["precision"] >= 0.50 and tr["recall"] >= 0.50:
-            print("Goal met: precision >= 0.50 and recall >= 0.50")
-        else:
-            print("Threshold reference")
-            _print_threshold_reference(y_test, analysis_test_prob, thresholds)
-        _print_threshold_sweep(y_test, analysis_test_prob, start=0.01, stop=0.50, step=0.01)
-
-    return {
-        "dataset": dataset_name,
-        "path": path,
+def _result_payload(
+    dataset: DatasetBundle,
+    best_result: Dict[str, object],
+    test_report: Optional[Dict[str, float]],
+    test_band: str,
+    test_auc: float,
+    search_results: Optional[List[Dict[str, object]]] = None,
+    confusion_matrix_path: Optional[Path] = None,
+) -> Dict[str, object]:
+    payload = {
+        "dataset": dataset.name,
+        "path": dataset.path,
         "best_preset": best_result["name"],
         "best_params": best_result["params"],
         "threshold": best_result["threshold"],
-        "selection_policy": selection_primary_metric,
-        "target_recall": selection_target_recall,
-        "max_false_alarm_rate": selection_max_false_alarm_rate,
+        "selection_policy": best_result["selection_policy"],
+        "target_recall": best_result["target_recall"],
+        "max_false_alarm_rate": best_result["max_false_alarm_rate"],
         "target_met": best_result["meets_target"],
         "train_sec": best_result["train_sec"],
         "val_report": best_result["val_report"],
         "val_band": best_result["val_band"],
         "val_auc": best_result["val_auc"],
-        "test_report": tr,
-        "test_band": best_result["test_band"],
-        "test_auc": best_result["test_auc"],
-        "all_results": search_results,
+        "test_report": test_report,
+        "test_band": test_band,
+        "test_auc": test_auc,
+        "confusion_matrix_path": confusion_matrix_path,
     }
+    if search_results is not None:
+        payload["all_results"] = search_results
+    return payload
 
+def _load_and_train_from_pickle(
+    path: Union[str, Path] = DEFAULT_DATA_PATH,
+    verbose: bool = False,
+    confusion_dir: Optional[Union[str, Path]] = CONFUSION_MATRIX_DIR,
+) -> Dict[str, object]:
+    dataset = _load_dataset_bundle(path, verbose=verbose)
+    _print_dataset_summary(dataset, verbose=verbose)
 
-def _run_dataset_suite(paths: List[Union[str, Path]], verbose: bool = False) -> None:
+    has_eval = dataset.has_eval
+    thresholds = _search_thresholds()
+
+    search_results = _run_search(dataset, thresholds)
+    best_result = _select_best_search_result(search_results, has_eval)
+
+    _print_experiment_table(search_results)
+    _print_defect_safety_table(search_results)
+
+    if verbose and has_eval:
+        _print_notable_results(search_results, SELECTION_MIN_ACCURACY)
+
+    _print_best_result(best_result, has_eval, verbose=verbose)
+
+    if not dataset.has_test:
+        print("  test: skipped")
+        return _result_payload(dataset, best_result, None, "n/a", float("nan"))
+
+    tr = best_result["test_report"]
+    test_band, test_note = _performance_band(tr)
+    print(f"  test: {_format_metric_line(tr, best_result['test_auc'])} | {test_band}")
+    print(f"  test cm: {tr['confusion_matrix'].tolist()}")
+    cm_path = _plot_confusion_matrix(tr, dataset.name, confusion_dir) if confusion_dir is not None else None
+    if cm_path is not None:
+        print(f"  confusion matrix plot: {cm_path}")
+    if verbose:
+        print(f"  note: {test_note}")
+
+    if verbose:
+        analysis_model = _make_search_model(best_result["params"])
+        analysis_model.fit(dataset.X_train, dataset.y_train, eval_set=(dataset.X_val, dataset.y_val) if dataset.has_eval else None)
+        analysis_test_prob = analysis_model.predict_proba(dataset.X_test)
+        if tr["precision"] >= 0.50 and tr["recall"] >= 0.50:
+            print("Goal met: precision >= 0.50 and recall >= 0.50")
+        else:
+            print("Threshold reference")
+            _print_threshold_reference(dataset.y_test, analysis_test_prob, thresholds)
+        _print_threshold_sweep(dataset.y_test, analysis_test_prob, start=0.01, stop=0.50, step=0.01)
+
+    return _result_payload(dataset, best_result, tr, best_result["test_band"], best_result["test_auc"], search_results, cm_path)
+
+def _run_dataset_suite(
+    paths: List[Union[str, Path]],
+    verbose: bool = False,
+    confusion_dir: Optional[Union[str, Path]] = CONFUSION_MATRIX_DIR,
+) -> None:
     preset_count = len(_build_search_presets())
     print("XGBoost Full Experiment Report")
     print(f"datasets: {len(paths)}")
     print(f"parameter sets: {preset_count}")
     print(f"total runs: {len(paths) * preset_count}")
 
-    results: List[Dict[str, object]] = []
-
-    for path in paths:
-        results.append(_load_and_train_from_pickle(path, verbose=verbose))
+    results = [_load_and_train_from_pickle(path, verbose=verbose, confusion_dir=confusion_dir) for path in paths]
 
     print("\n" + "=" * 120)
     print("Final summary")
@@ -1530,10 +1272,10 @@ def _run_dataset_suite(paths: List[Union[str, Path]], verbose: bool = False) -> 
             f"{str(item['dataset']):<32} {str(item['best_preset']):<18} "
             f"{float(item['threshold']):>5.2f} {float(item['train_sec']):>7.2f} "
             f"{report['accuracy']:>8.4f} {report['precision']:>8.4f} "
-            f"{report['recall']:>8.4f} {report['f1']:>8.4f} {float(item['test_auc']):>8.4f} {str(item['test_band']):>8} "
+            f"{report['recall']:>8.4f} {report['f1']:>8.4f} "
+            f"{float(item['test_auc']):>8.4f} {str(item['test_band']):>8} "
             f"{int(report['tn']):>5} {int(report['fp']):>5} {int(report['fn']):>5} {int(report['tp']):>5}"
         )
-
 
 def _best_threshold(
     y_true: np.ndarray,
@@ -1544,21 +1286,6 @@ def _best_threshold(
     max_false_alarm_rate: float = 1.0,
     primary_metric: str = "f1",
 ) -> Tuple[float, float, bool]:
-    """
-    Sweep thresholds and return the one that best matches the selected policy.
-
-    Current supported policies:
-    - primary_metric="f1": maximise F1 with accuracy as a tie-breaker
-    - primary_metric="recall": maximise recall, then precision, F1, accuracy
-    - primary_metric="recall_guard": first require recall >= min_recall and
-      false_alarm_rate <= max_false_alarm_rate, then choose the threshold with
-      the best recall / false-alarm / precision tradeoff
-
-    Thresholds that satisfy the active safety constraint are always preferred.
-    If none satisfy that constraint, the best unconstrained threshold is returned.
-
-    Returns (best_threshold, best_score_value, safety_constraint_met).
-    """
     best_thresh = thresholds[0]
     best_score = None
     found_valid = False
@@ -1567,64 +1294,34 @@ def _best_threshold(
     for t in thresholds:
         y_pred = (y_prob >= t).astype(np.int8)
         rep = Metrics.classification_report(y_true, y_pred)
+        acc, precision, recall, f1, fa = rep["accuracy"], rep["precision"], rep["recall"], rep["f1"], rep["false_alarm_rate"]
 
         if primary_metric == "recall_guard":
-            score = (
-                rep["recall"],
-                -rep["false_alarm_rate"],
-                rep["precision"],
-                rep["f1"],
-                rep["accuracy"],
-            )
-            fallback_score = (
-                1 if rep["recall"] >= min_recall else 0,
-                1 if rep["false_alarm_rate"] <= max_false_alarm_rate else 0,
-                rep["recall"],
-                -rep["false_alarm_rate"],
-                rep["precision"],
-                rep["f1"],
-                rep["accuracy"],
-            )
-            score_value = rep["recall"]
-            meets = (
-                rep["recall"] >= min_recall
-                and rep["false_alarm_rate"] <= max_false_alarm_rate
-                and rep["accuracy"] >= min_accuracy
-            )
+            score = (recall, -fa, precision, f1, acc)
+            fallback_score = (int(recall >= min_recall), int(fa <= max_false_alarm_rate), *score)
+            score_value = recall
+            meets = recall >= min_recall and fa <= max_false_alarm_rate and acc >= min_accuracy
         elif primary_metric == "recall":
-            score = (
-                rep["recall"],
-                rep["precision"],
-                rep["f1"],
-                rep["accuracy"],
-            )
+            score = (recall, precision, f1, acc)
             fallback_score = score
-            score_value = rep["recall"]
-            meets = rep["accuracy"] >= min_accuracy
+            score_value = recall
+            meets = acc >= min_accuracy
         else:
-            score = (
-                rep["f1"],
-                rep["recall"],
-                rep["precision"],
-                rep["accuracy"],
-            )
+            score = (f1, recall, precision, acc)
             fallback_score = score
-            score_value = rep["f1"]
-            meets = rep["accuracy"] >= min_accuracy
+            score_value = f1
+            meets = acc >= min_accuracy
 
-        if meets:
-            if not found_valid or score > best_score:
-                best_score = score
-                best_thresh = t
-                best_score_value = score_value
-                found_valid = True
-        elif not found_valid and (best_score is None or fallback_score > best_score):
-            best_score = fallback_score
+        candidate_score = score if meets else fallback_score
+        if (meets and (not found_valid or candidate_score > best_score)) or (
+            not meets and not found_valid and (best_score is None or candidate_score > best_score)
+        ):
+            best_score = candidate_score
             best_thresh = t
             best_score_value = score_value
+            found_valid = found_valid or meets
 
     return best_thresh, best_score_value, found_valid
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -1642,11 +1339,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Print full dataset details and threshold tables.",
     )
+    parser.add_argument(
+        "--confusion-dir",
+        type=str,
+        default=str(CONFUSION_MATRIX_DIR),
+        help="Directory for test confusion matrix PNGs. Use an empty string to skip saving.",
+    )
     args = parser.parse_args()
+    confusion_dir = args.confusion_dir if args.confusion_dir else None
     if args.data_paths:
         if len(args.data_paths) == 1:
-            _load_and_train_from_pickle(args.data_paths[0], verbose=args.verbose)
+            _load_and_train_from_pickle(args.data_paths[0], verbose=args.verbose, confusion_dir=confusion_dir)
         else:
-            _run_dataset_suite(args.data_paths, verbose=args.verbose)
+            _run_dataset_suite(args.data_paths, verbose=args.verbose, confusion_dir=confusion_dir)
     else:
-        _run_dataset_suite(DEFAULT_DATASET_SUITE, verbose=args.verbose)
+        _run_dataset_suite(DEFAULT_DATASET_SUITE, verbose=args.verbose, confusion_dir=confusion_dir)
