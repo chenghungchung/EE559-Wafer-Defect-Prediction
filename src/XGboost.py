@@ -7,16 +7,25 @@ import pickle
 import os
 import time
 
+
+# Project paths and default experiment settings.
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
 CONFUSION_MATRIX_DIR = OUTPUT_DIR / "xgboost_confusion_matrices"
 DEFAULT_DATA_PATH = DATA_DIR / "preprocessed_data_outlier_pca.pkl"
-DEFAULT_DATASET_SUITE = [DATA_DIR / "preprocessed_data.pkl", DATA_DIR / "preprocessed_data_outlier_pca.pkl", DATA_DIR / "preprocessed_data_vae_enhanced.pkl"]
+DEFAULT_DATASET_SUITE = [
+    DATA_DIR / "preprocessed_data.pkl",
+    DATA_DIR / "preprocessed_data_outlier_pca.pkl",
+    DATA_DIR / "preprocessed_data_vae_enhanced.pkl",
+]
+
+# Validation rule used when choosing the best preset and threshold.
 SELECTION_MIN_ACCURACY = 0.0
 SELECTION_TARGET_RECALL = 0.80
 SELECTION_MAX_FALSE_ALARM_RATE = 0.50
 SELECTION_PRIMARY_METRIC = "recall_guard"
 
+# Base loss interface for the boosting model.
 class Loss:
     name: str = "base"
 
@@ -29,6 +38,8 @@ class Loss:
     def transform(self, y_pred_raw: np.ndarray) -> np.ndarray:
         return y_pred_raw
 
+
+# Logistic loss for binary classification.
 class LogisticLoss(Loss):
     name = "logloss"
 
@@ -50,6 +61,7 @@ class LogisticLoss(Loss):
     def transform(self, y_pred_raw: np.ndarray) -> np.ndarray:
         return self._sigmoid(y_pred_raw)
 
+# Basic binary classification metrics.
 class Metrics:
     @staticmethod
     def confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
@@ -85,7 +97,9 @@ class Metrics:
             "confusion_matrix": cm,
         }
 
+
 def compute_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    # Use the rank-sum formula so the file does not depend on sklearn.
     y_true = np.asarray(y_true).reshape(-1).astype(np.int8)
     y_prob = np.asarray(y_prob).reshape(-1).astype(np.float64)
 
@@ -104,6 +118,7 @@ def compute_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     start = 0
     n = sorted_prob.shape[0]
     while start < n:
+        # Tied probabilities share the average rank.
         end = start + 1
         while end < n and sorted_prob[end] == sorted_prob[start]:
             end += 1
@@ -119,6 +134,7 @@ def compute_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
 
+
 def threshold_sweep_analysis(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -126,6 +142,7 @@ def threshold_sweep_analysis(
     stop: float = 0.50,
     step: float = 0.01,
 ) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+    # Sweep probability thresholds and keep the best F1 result.
     y_true = np.asarray(y_true).reshape(-1).astype(np.int8)
     y_prob = np.asarray(y_prob).reshape(-1).astype(np.float64)
 
@@ -139,11 +156,13 @@ def threshold_sweep_analysis(
     default = {"threshold": float("nan"), "precision": float("nan"), "recall": float("nan"), "f1": float("nan")}
     return rows, max(rows, key=lambda row: (row["f1"], row["precision"], row["recall"]), default=default)
 
+# Small containers used while building a tree.
 @dataclass
 class SplitCandidate:
     feature: int
     split_bin: int
     gain_raw: float
+
 
 @dataclass
 class TreeNode:
@@ -157,6 +176,7 @@ class TreeNode:
     gain_raw: float = 0.0
     left: Optional["TreeNode"] = None
     right: Optional["TreeNode"] = None
+
 
 class HistogramTree:
     def __init__(
@@ -192,22 +212,18 @@ class HistogramTree:
         n_samples, n_features = X_bins.shape
         rng = np.random.default_rng(self.random_state)
 
+        # Column sampling makes each tree a little different.
         n_cols = max(1, int(np.ceil(self.colsample_bytree * n_features)))
         self.feature_indices_ = np.sort(rng.choice(n_features, size=n_cols, replace=False))
 
+        # Store simple feature importance while the tree grows.
         self.gain_importance_ = np.zeros(n_features, dtype=np.float64)
         self.freq_importance_ = np.zeros(n_features, dtype=np.float64)
 
         all_idx = np.arange(n_samples, dtype=np.int32)
         self.root = self._build_depthwise(X_bins, grad, hess, all_idx, depth=0)
 
-    def _best_split(
-        self,
-        X_bins: np.ndarray,
-        grad: np.ndarray,
-        hess: np.ndarray,
-        idx: np.ndarray,
-    ) -> Optional[SplitCandidate]:
+    def _best_split(self, X_bins: np.ndarray, grad: np.ndarray, hess: np.ndarray, idx: np.ndarray) -> Optional[SplitCandidate]:
         if idx.size <= 1:
             return None
 
@@ -221,10 +237,12 @@ class HistogramTree:
         best_split = None
 
         for feat in self.feature_indices_:
+            # Build gradient and hessian histograms for this feature.
             bins = X_bins[idx, feat]
             g_hist = np.bincount(bins, weights=g_node, minlength=self.n_bins).astype(np.float64)
             h_hist = np.bincount(bins, weights=h_node, minlength=self.n_bins).astype(np.float64)
 
+            # Cumulative sums let us score every possible bin split.
             G_left = np.cumsum(g_hist)[:-1]
             H_left = np.cumsum(h_hist)[:-1]
             G_right = G_total - G_left
@@ -245,34 +263,24 @@ class HistogramTree:
 
         return best_split
 
-    def _split_indices(
-        self,
-        X_bins: np.ndarray,
-        idx: np.ndarray,
-        split: SplitCandidate,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _split_indices(self, X_bins: np.ndarray, idx: np.ndarray, split: SplitCandidate) -> Tuple[np.ndarray, np.ndarray]:
         col = X_bins[idx, split.feature]
         left_mask = col <= split.split_bin
         if left_mask.sum() == 0 or left_mask.sum() == idx.size:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
         return idx[left_mask], idx[~left_mask]
 
-    def _build_depthwise(
-        self,
-        X_bins: np.ndarray,
-        grad: np.ndarray,
-        hess: np.ndarray,
-        idx: np.ndarray,
-        depth: int,
-    ) -> TreeNode:
+    def _build_depthwise(self, X_bins: np.ndarray, grad: np.ndarray, hess: np.ndarray, idx: np.ndarray, depth: int) -> TreeNode:
         G = float(grad[idx].sum())
         H = float(hess[idx].sum())
         node = TreeNode(True, self._leaf_value(G, H), G, H, depth)
 
+        # Stop growing when the node is too deep or too small.
         if depth >= self.max_depth or H < self.min_child_weight or idx.size <= 1:
             return node
 
         split = self._best_split(X_bins, grad, hess, idx)
+        # Keep this node as a leaf if no split improves the objective.
         if split is None or split.gain_raw <= self.gamma:
             return node
 
@@ -313,12 +321,15 @@ class HistogramTree:
         self._predict_node(X_bins, np.arange(X_bins.shape[0]), self.root, out)
         return out
 
+
 @dataclass
 class TrainingLog:
     iteration: int
     train_loss: float
     valid_loss: Optional[float] = None
 
+
+# Main gradient boosting model.
 class Booster:
     def __init__(
         self,
@@ -384,6 +395,7 @@ class Booster:
         assert valid_unique, f"{name} must contain only labels {{0,1}}; got {unique}."
 
     def _build_bin_edges(self, X: np.ndarray) -> List[np.ndarray]:
+        # Fit quantile bins on the training data.
         quantiles = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]
         edges: List[np.ndarray] = []
         eps = 1e-12
@@ -409,6 +421,7 @@ class Booster:
         if self.bin_edges_ is None:
             raise RuntimeError("Model is not fitted.")
 
+        # Convert each feature value into its bin index.
         X_bins = np.empty(X.shape, dtype=np.int16)
         for j, edges in enumerate(self.bin_edges_):
             X_bins[:, j] = np.searchsorted(edges, X[:, j], side="right").astype(np.int16)
@@ -425,6 +438,7 @@ class Booster:
     def _apply_class_weight(self, y: np.ndarray, grad: np.ndarray, hess: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if self.resolved_scale_pos_weight_ == 1.0:
             return grad, hess
+        # Defect samples are rare, so their gradients can be upweighted.
         pos = y == 1
         grad[pos] *= self.resolved_scale_pos_weight_
         hess[pos] *= self.resolved_scale_pos_weight_
@@ -447,6 +461,7 @@ class Booster:
         self._assert_no_nan(X, "X_train")
         self._assert_binary_labels(y, "y_train")
 
+        # Reset all fitted state before starting a new training run.
         rng = np.random.default_rng(self.random_state)
         n_samples, n_features = X.shape
         self.n_features_ = n_features
@@ -471,6 +486,7 @@ class Booster:
         self.bin_edges_ = self._build_bin_edges(X)
         X_bins = self._transform_to_bins(X)
 
+        # Validation data uses the same bins learned from training data.
         X_val_bins, y_val = None, None
         if eval_set is not None:
             X_val, y_val = eval_set
@@ -492,9 +508,11 @@ class Booster:
         for t in range(self.n_estimators):
             if self.verbose:
                 print(f"Iteration {t + 1}")
+            # Fit each tree to the current gradient and hessian.
             grad, hess = self.loss_fn.grad_hess(y, pred_raw)
             grad, hess = self._apply_class_weight(y, grad, hess)
 
+            # Row sampling reduces overfitting and training cost.
             n_rows = max(1, int(np.ceil(self.subsample * n_samples)))
             row_idx = rng.choice(n_samples, size=n_rows, replace=False)
 
@@ -510,6 +528,7 @@ class Booster:
             tree.fit(X_bins[row_idx], grad[row_idx], hess[row_idx])
             self.trees.append(tree)
 
+            # Add the new tree output to the ensemble prediction.
             pred_raw += self.learning_rate * tree.predict(X_bins)
             self.feature_importance_gain_ += tree.gain_importance_
             self.feature_importance_freq_ += tree.freq_importance_
@@ -566,6 +585,7 @@ class Booster:
             and eval_set is not None
             and self.best_iteration_ is not None
         ):
+            # Keep only trees up to the best validation iteration.
             self.trees = self.trees[: self.best_iteration_ + 1]
             self.feature_importance_gain_.fill(0.0)
             self.feature_importance_freq_.fill(0.0)
@@ -607,13 +627,17 @@ class Booster:
                 imp /= s
         return imp
 
+
 class XGBoost(Booster):
     pass
 
+# Defaults used for every preset in the parameter search.
 SEARCH_MODEL_KWARGS = dict(auto_scale_pos_weight=False, base_score=None, early_stopping_rounds=None, early_stopping_metric="loss", random_state=42, verbose=False)
+
 
 def _make_search_model(model_params: Dict[str, object]) -> XGBoost:
     return XGBoost(**SEARCH_MODEL_KWARGS, **model_params)
+
 
 def _evaluate_probabilities(
     y_true: np.ndarray,
@@ -625,7 +649,9 @@ def _evaluate_probabilities(
     auc = compute_auc(y_true, y_prob)
     return report, auc
 
+
 def _build_search_presets() -> List[Dict[str, object]]:
+    # Presets are grouped into naive-Bayes-weighted and balanced variants.
     nb_base = dict(subsample=0.8, colsample_bytree=0.8, reg_lambda=3.0, scale_pos_weight=14.01369863, n_bins=64)
     balanced_base = dict(
         n_estimators=500,
@@ -657,6 +683,7 @@ def _build_search_presets() -> List[Dict[str, object]]:
     ]
     return [{"name": name, **base, **overrides} for name, base, overrides in specs]
 
+
 def train_and_evaluate_preprocessed(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -670,13 +697,17 @@ def train_and_evaluate_preprocessed(
     y_pred = model.predict(X_test)
     return Metrics.classification_report(y_test, y_pred)
 
+
 def _as_numpy(name: str, arr, verbose: bool = False) -> np.ndarray:
+    # Convert pandas or list-like inputs into NumPy arrays.
     out = np.asarray(arr)
     if verbose:
         print(f"{name}: shape={out.shape}, dtype={out.dtype}")
     return out
 
+
 def _normalize_binary_labels(y: np.ndarray, name: str, verbose: bool = False) -> np.ndarray:
+    # Some preprocessing files store labels as {-1, 1}.
     y = np.asarray(y).reshape(-1)
     uniq = np.unique(y)
     if np.array_equal(uniq, np.array([-1, 1])) or np.array_equal(uniq, np.array([-1])) or np.array_equal(uniq, np.array([1])):
@@ -685,11 +716,14 @@ def _normalize_binary_labels(y: np.ndarray, name: str, verbose: bool = False) ->
         y = ((y + 1) // 2).astype(np.int8)
     return y.astype(np.int8)
 
+
 def _detect_key(d: dict, candidates: List[str]):
     lower_map = {str(k).lower(): k for k in d.keys()}
     return next((lower_map[c] for c in candidates if c in lower_map), None)
 
+
 def _extract_splits(data_obj):
+    # Accept a few common pickle layouts for train/validation/test splits.
     X_train = y_train = X_val = y_val = X_test = y_test = None
 
     if isinstance(data_obj, dict):
@@ -732,6 +766,7 @@ def _extract_splits(data_obj):
 
 @dataclass
 class DatasetBundle:
+    # One loaded dataset plus basic metadata.
     path: str
     name: str
     data_obj: object
@@ -785,6 +820,7 @@ def _feature_names_for(data_obj: object, n_features: int) -> List[str]:
     return [f"{prefix}{i + 1}" if prefix == "PC" else f"{prefix}{i}" for i in range(n_features)]
 
 def _load_dataset_bundle(path: Union[str, Path], verbose: bool = False) -> DatasetBundle:
+    # Standardize the pickle payload into one DatasetBundle object.
     path_str, dataset_name, data_obj = _load_pickle_payload(path)
     note, n_components, explained_var = _payload_metadata(data_obj)
 
@@ -837,6 +873,7 @@ def _print_dataset_summary(dataset: DatasetBundle, verbose: bool = False) -> Non
     if verbose:
         _print_feature_summary(dataset.X_train, dataset.feature_names)
 
+
 def _performance_band(report: Optional[Dict[str, float]]) -> Tuple[str, str]:
     if report is None:
         return "n/a", "no report"
@@ -854,10 +891,12 @@ def _performance_band(report: Optional[Dict[str, float]]) -> Tuple[str, str]:
         return "usable", "directionally useful, but still noisy"
     return "weak", "still too noisy or misses too many positives"
 
+
 def _split_summary(name: str, X: np.ndarray, y: np.ndarray) -> str:
     positives = int(np.sum(y == 1))
     negatives = int(np.sum(y == 0))
     return f"{name}: {X.shape[0]} x {X.shape[1]} (pos={positives}, neg={negatives})"
+
 
 def _format_metric_line(report: Dict[str, float], auc: float) -> str:
     text = (
@@ -871,14 +910,24 @@ def _format_metric_line(report: Dict[str, float], auc: float) -> str:
     text += f" fn={int(report['fn'])} miss={report['miss_rate']:.4f}"
     return text
 
+
 def _format_table_number(value: float, width: int = 6) -> str:
-    return f"{'N/A':>{width}}" if value is None or np.isnan(float(value)) else f"{float(value):>{width}.3f}"
+    if value is None or np.isnan(float(value)):
+        return f"{'N/A':>{width}}"
+    return f"{float(value):>{width}.3f}"
+
 
 def _format_table_metric(report: Optional[Dict[str, float]], key: str, width: int = 6) -> str:
-    return f"{'N/A':>{width}}" if report is None else _format_table_number(float(report[key]), width=width)
+    if report is None:
+        return f"{'N/A':>{width}}"
+    return _format_table_number(float(report[key]), width=width)
+
 
 def _format_table_count(report: Optional[Dict[str, float]], key: str, width: int = 4) -> str:
-    return f"{'N/A':>{width}}" if report is None else f"{int(report[key]):>{width}}"
+    if report is None:
+        return f"{'N/A':>{width}}"
+    return f"{int(report[key]):>{width}}"
+
 
 def _print_experiment_table(search_results: List[Dict[str, object]]) -> None:
     print("Experiment results")
@@ -907,6 +956,7 @@ def _print_experiment_table(search_results: List[Dict[str, object]]) -> None:
             f"{str(grade):>8}"
         )
 
+
 def _print_defect_safety_table(search_results: List[Dict[str, object]]) -> None:
     print("\nDefect-safety view")
     print(
@@ -928,6 +978,7 @@ def _print_defect_safety_table(search_results: List[Dict[str, object]]) -> None:
             f"{_format_table_metric(test_report, 'false_alarm_rate')}"
         )
 
+
 def _print_feature_summary(X: np.ndarray, feature_names: List[str]) -> None:
     print(f"\nFeature summary ({X.shape[0]} samples x {X.shape[1]} features)")
     print(f"{'Feature':<10} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}  {'Skew':>8}")
@@ -943,6 +994,7 @@ def _print_feature_summary(X: np.ndarray, feature_names: List[str]) -> None:
             f"{min_value:>10.4f} {max_value:>10.4f}  {skew:>8.3f}"
         )
 
+
 def _search_result_key(
     item: Dict[str, object],
     policy: str,
@@ -950,22 +1002,37 @@ def _search_result_key(
     target_recall: float = 0.0,
     max_false_alarm_rate: float = 1.0,
 ) -> Tuple[float, ...]:
+    # Ranking key used to choose the validation-selected preset.
     report = item["val_report"]
     if report is None:
         return (float("-inf"),)
-    r = report
+
+    accuracy = report["accuracy"]
+    precision = report["precision"]
+    recall = report["recall"]
+    f1 = report["f1"]
+    false_alarm_rate = report["false_alarm_rate"]
+
     if policy == "selected" and item.get("selection_policy") == "recall_guard":
-        return (int(r["recall"] >= target_recall), int(r["false_alarm_rate"] <= max_false_alarm_rate), int(item["meets_target"]), r["recall"], -r["false_alarm_rate"], r["precision"], r["f1"], r["accuracy"])
+        recall_ok = int(recall >= target_recall)
+        false_alarm_ok = int(false_alarm_rate <= max_false_alarm_rate)
+        target_met = int(item["meets_target"])
+        return (recall_ok, false_alarm_ok, target_met, recall, -false_alarm_rate, precision, f1, accuracy)
+
     if policy == "selected":
-        return (int(item["meets_target"]), r["recall"], r["precision"], r["f1"], r["accuracy"])
-    keys = {
-        "recall": (int(r["accuracy"] >= min_accuracy), r["recall"], r["precision"], r["f1"], r["accuracy"]),
-        "balanced": (int(r["accuracy"] >= min_accuracy), r["f1"], r["recall"], r["precision"], r["accuracy"]),
-        "precision": (int(r["accuracy"] >= min_accuracy), int(r["recall"] >= 0.25), r["precision"], r["f1"], r["accuracy"]),
-    }
-    if policy not in keys:
-        raise ValueError(f"Unknown search policy: {policy}")
-    return keys[policy]
+        return (int(item["meets_target"]), recall, precision, f1, accuracy)
+
+    accuracy_ok = int(accuracy >= min_accuracy)
+    if policy == "recall":
+        return (accuracy_ok, recall, precision, f1, accuracy)
+    if policy == "balanced":
+        return (accuracy_ok, f1, recall, precision, accuracy)
+    if policy == "precision":
+        recall_floor_ok = int(recall >= 0.25)
+        return (accuracy_ok, recall_floor_ok, precision, f1, accuracy)
+
+    raise ValueError(f"Unknown search policy: {policy}")
+
 
 def _print_notable_results(search_results: List[Dict[str, object]], min_accuracy: float) -> None:
     picks = [
@@ -983,6 +1050,7 @@ def _print_notable_results(search_results: List[Dict[str, object]], min_accuracy
             f"AUC={item['val_auc']:.3f}  grade={item['val_band']}"
         )
 
+
 def _print_threshold_reference(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -995,6 +1063,7 @@ def _print_threshold_reference(
         meets_goal = "yes" if report["precision"] >= 0.50 and report["recall"] >= 0.50 else ""
         print(f"{threshold:>10.2f} {report['accuracy']:>10.4f} {report['precision']:>10.4f} {report['recall']:>8.4f} {report['f1']:>8.4f} {meets_goal:>14}")
 
+
 def _print_threshold_sweep(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -1006,24 +1075,42 @@ def _print_threshold_sweep(
     print("\nThreshold sweep")
     print(f"{'Threshold':>10} {'Precision':>10} {'Recall':>8} {'F1':>8}")
     for row in sweep_rows:
-        print(f"{row['threshold']:>10.2f} {row['precision']:>10.4f} {row['recall']:>8.4f} {row['f1']:>8.4f}")
+        print(
+            f"{row['threshold']:>10.2f} {row['precision']:>10.4f} "
+            f"{row['recall']:>8.4f} {row['f1']:>8.4f}"
+        )
 
     print("\nBest threshold by F1:")
-    print(f"  threshold = {best_sweep['threshold']:.2f}\n  precision = {best_sweep['precision']:.4f}\n  recall    = {best_sweep['recall']:.4f}\n  f1        = {best_sweep['f1']:.4f}")
+    print(f"  threshold = {best_sweep['threshold']:.2f}")
+    print(f"  precision = {best_sweep['precision']:.4f}")
+    print(f"  recall    = {best_sweep['recall']:.4f}")
+    print(f"  f1        = {best_sweep['f1']:.4f}")
+
 
 def _load_pyplot():
+    # Keep matplotlib cache files inside the project output folder.
     for env_name, folder in {"MPLCONFIGDIR": ".matplotlib", "XDG_CACHE_HOME": ".cache"}.items():
         path = OUTPUT_DIR / folder
         path.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault(env_name, os.fspath(path))
-    import matplotlib; matplotlib.use("Agg")
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     return plt
+
 
 def _safe_filename_stem(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in Path(name).stem) or "dataset"
 
-def _plot_confusion_matrix(report: Optional[Dict[str, float]], dataset_name: str, output_dir: Union[str, Path]) -> Optional[Path]:
+
+def _plot_confusion_matrix(
+    report: Optional[Dict[str, float]],
+    dataset_name: str,
+    output_dir: Union[str, Path],
+) -> Optional[Path]:
+    # Save the test confusion matrix for the selected preset.
     if report is None or "confusion_matrix" not in report:
         return None
     try:
@@ -1031,6 +1118,7 @@ def _plot_confusion_matrix(report: Optional[Dict[str, float]], dataset_name: str
     except ImportError:
         print("  confusion matrix plot skipped: matplotlib is not installed")
         return None
+
     cm = np.asarray(report["confusion_matrix"], dtype=np.int64)
     fig, ax = plt.subplots(figsize=(5.8, 5.0))
     image = ax.imshow(cm, cmap="Blues")
@@ -1039,10 +1127,13 @@ def _plot_confusion_matrix(report: Optional[Dict[str, float]], dataset_name: str
     ax.set_ylabel("True label")
     ax.set_xticks([0, 1], labels=["0 normal", "1 defect"])
     ax.set_yticks([0, 1], labels=["0 normal", "1 defect"])
-    threshold = 0.55 * max(1, int(cm.max()))
+
+    cutoff = 0.55 * max(1, int(cm.max()))
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color="white" if cm[i, j] > threshold else "black", fontsize=14, fontweight="bold")
+            color = "white" if cm[i, j] > cutoff else "black"
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color=color, fontsize=14, fontweight="bold")
+
     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     output_path = Path(output_dir) / f"{_safe_filename_stem(dataset_name)}_confusion_matrix.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1057,6 +1148,7 @@ def _run_search_preset(
     config: Dict[str, object],
     thresholds: List[float],
 ) -> Dict[str, object]:
+    # Train one preset and evaluate it with the selected threshold.
     name = config["name"]
     model_params = {k: v for k, v in config.items() if k != "name"}
     t0 = time.perf_counter()
@@ -1113,6 +1205,7 @@ def _run_search(
     dataset: DatasetBundle,
     thresholds: List[float],
 ) -> List[Dict[str, object]]:
+    # Run all preset configurations on one dataset.
     param_grid = _build_search_presets()
     print(
         f"  trying {len(param_grid)} preset settings "
@@ -1125,6 +1218,7 @@ def _select_best_search_result(
     search_results: List[Dict[str, object]],
     has_eval: bool,
 ) -> Dict[str, object]:
+    # Pick the best preset based on validation metrics.
     return search_results[0] if not has_eval else max(
         search_results,
         key=lambda item: _search_result_key(
@@ -1165,6 +1259,7 @@ def _result_payload(
     search_results: Optional[List[Dict[str, object]]] = None,
     confusion_matrix_path: Optional[Path] = None,
 ) -> Dict[str, object]:
+    # Collect the final result in one dictionary for summary printing.
     payload = {
         "dataset": dataset.name,
         "path": dataset.path,
@@ -1188,11 +1283,13 @@ def _result_payload(
         payload["all_results"] = search_results
     return payload
 
+
 def _load_and_train_from_pickle(
     path: Union[str, Path] = DEFAULT_DATA_PATH,
     verbose: bool = False,
     confusion_dir: Optional[Union[str, Path]] = CONFUSION_MATRIX_DIR,
 ) -> Dict[str, object]:
+    # Full training and evaluation pipeline for one pickle file.
     dataset = _load_dataset_bundle(path, verbose=verbose)
     _print_dataset_summary(dataset, verbose=verbose)
 
@@ -1237,18 +1334,23 @@ def _load_and_train_from_pickle(
 
     return _result_payload(dataset, best_result, tr, best_result["test_band"], best_result["test_auc"], search_results, cm_path)
 
+
 def _run_dataset_suite(
     paths: List[Union[str, Path]],
     verbose: bool = False,
     confusion_dir: Optional[Union[str, Path]] = CONFUSION_MATRIX_DIR,
 ) -> None:
+    # Compare the same experiment across multiple preprocessing outputs.
     preset_count = len(_build_search_presets())
     print("XGBoost Full Experiment Report")
     print(f"datasets: {len(paths)}")
     print(f"parameter sets: {preset_count}")
     print(f"total runs: {len(paths) * preset_count}")
 
-    results = [_load_and_train_from_pickle(path, verbose=verbose, confusion_dir=confusion_dir) for path in paths]
+    results = []
+    for path in paths:
+        result = _load_and_train_from_pickle(path, verbose=verbose, confusion_dir=confusion_dir)
+        results.append(result)
 
     print("\n" + "=" * 120)
     print("Final summary")
@@ -1277,6 +1379,7 @@ def _run_dataset_suite(
             f"{int(report['tn']):>5} {int(report['fp']):>5} {int(report['fn']):>5} {int(report['tp']):>5}"
         )
 
+
 def _best_threshold(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -1286,6 +1389,7 @@ def _best_threshold(
     max_false_alarm_rate: float = 1.0,
     primary_metric: str = "f1",
 ) -> Tuple[float, float, bool]:
+    # Prefer thresholds that satisfy the active validation rule.
     best_thresh = thresholds[0]
     best_score = None
     found_valid = False
@@ -1294,34 +1398,52 @@ def _best_threshold(
     for t in thresholds:
         y_pred = (y_prob >= t).astype(np.int8)
         rep = Metrics.classification_report(y_true, y_pred)
-        acc, precision, recall, f1, fa = rep["accuracy"], rep["precision"], rep["recall"], rep["f1"], rep["false_alarm_rate"]
+        accuracy = rep["accuracy"]
+        precision = rep["precision"]
+        recall = rep["recall"]
+        f1 = rep["f1"]
+        false_alarm_rate = rep["false_alarm_rate"]
 
         if primary_metric == "recall_guard":
-            score = (recall, -fa, precision, f1, acc)
-            fallback_score = (int(recall >= min_recall), int(fa <= max_false_alarm_rate), *score)
+            score = (recall, -false_alarm_rate, precision, f1, accuracy)
+            fallback_score = (
+                int(recall >= min_recall),
+                int(false_alarm_rate <= max_false_alarm_rate),
+                *score,
+            )
             score_value = recall
-            meets = recall >= min_recall and fa <= max_false_alarm_rate and acc >= min_accuracy
+            meets = (
+                recall >= min_recall
+                and false_alarm_rate <= max_false_alarm_rate
+                and accuracy >= min_accuracy
+            )
         elif primary_metric == "recall":
-            score = (recall, precision, f1, acc)
+            score = (recall, precision, f1, accuracy)
             fallback_score = score
             score_value = recall
-            meets = acc >= min_accuracy
+            meets = accuracy >= min_accuracy
         else:
-            score = (f1, recall, precision, acc)
+            score = (f1, recall, precision, accuracy)
             fallback_score = score
             score_value = f1
-            meets = acc >= min_accuracy
+            meets = accuracy >= min_accuracy
 
         candidate_score = score if meets else fallback_score
-        if (meets and (not found_valid or candidate_score > best_score)) or (
-            not meets and not found_valid and (best_score is None or candidate_score > best_score)
-        ):
+        valid_candidate_is_better = meets and (not found_valid or candidate_score > best_score)
+        fallback_candidate_is_better = (
+            not meets
+            and not found_valid
+            and (best_score is None or candidate_score > best_score)
+        )
+
+        if valid_candidate_is_better or fallback_candidate_is_better:
             best_score = candidate_score
             best_thresh = t
             best_score_value = score_value
             found_valid = found_valid or meets
 
     return best_thresh, best_score_value, found_valid
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
