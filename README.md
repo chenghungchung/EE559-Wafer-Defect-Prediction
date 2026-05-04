@@ -15,12 +15,13 @@ Python 3.11.9
 Main Python packages used:
 
 ```text
-numpy: 2.2.3
-pandas: 2.3.1
-matplotlib: 3.10.0
+Python: 3.13.9
+numpy: 2.3.5
+pandas: 2.3.3
+matplotlib: 3.10.6
 scikit-learn: 1.7.2
 xgboost: 3.2.0
-torch: 2.6.0+cu124
+torch: 2.11.0
 pickle: built-in Python standard library
 ```
 
