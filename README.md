@@ -6,13 +6,7 @@ Because the dataset is highly imbalanced, the main focus of this project is impr
 
 ## Environment
 
-This project was developed and tested using:
-
-```text
-Python 3.11.9
-```
-
-Main Python packages used:
+This project was developed and tested with the following environment:
 
 ```text
 Python: 3.13.9
@@ -25,11 +19,19 @@ torch: 2.11.0
 pickle: built-in Python standard library
 ```
 
-To install the main required packages, run:
+To reproduce the tested environment, run:
 
 ```bash
-pip install numpy pandas matplotlib scikit-learn xgboost torch
+python -m pip install numpy==2.3.5 pandas==2.3.3 matplotlib==3.10.6 scikit-learn==1.7.2 xgboost==3.2.0 torch==2.11.0
 ```
+
+If exact package matching is not required, the main packages can also be installed with:
+
+```bash
+python -m pip install numpy pandas matplotlib scikit-learn xgboost torch
+```
+
+Note: the preprocessed `.pkl` files store pandas `DataFrame` / `Series` objects. If `pickle.load()` fails on another computer, first make sure that `pandas` and `numpy` are installed in the same Python environment used to run the code. Matching the tested versions above is the safest option.
 
 ## Repository Organization Note
 
